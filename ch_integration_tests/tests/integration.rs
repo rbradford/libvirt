@@ -9,14 +9,14 @@ extern crate lazy_static;
 
 #[cfg(test)]
 mod tests {
-    use test_infra::{
-        DiskConfig, DiskType, GuestNetworkConfig, UbuntuDiskConfig, WaitForBootError,
-    };
     use std::io::{self, Write};
     use std::process::{Child, Command, Stdio};
     use std::sync::Mutex;
     use std::thread;
     use std::{ffi::OsStr, path::PathBuf};
+    use test_infra::{
+        DiskConfig, DiskType, GuestNetworkConfig, UbuntuDiskConfig, WaitForBootError,
+    };
 
     use uuid::Uuid;
     use vmm_sys_util::tempdir::TempDir;
@@ -36,6 +36,9 @@ mod tests {
         kernel_path: PathBuf,
         network: GuestNetworkConfig,
         disk_config: &'a dyn DiskConfig,
+        net_name: String,
+        bridge_name: String,
+        net_uuid: String,
     }
 
     impl<'a> std::panic::RefUnwindSafe for Guest<'a> {}
@@ -66,12 +69,11 @@ mod tests {
                 <console type='pty'> \
                         <target type='virtio' port='0'/> \
                 </console> \
-                <interface type='ethernet'> \
+                <interface type='network'> \
                         <mac address='{}'/> \
+                        <ip address='{}' prefix='24'/> \
                         <model type='virtio'/> \
-                        <source> \
-                               <ip address='{}' prefix='24'/> \
-                        </source> \
+                        <source network='{}' bridge='{}'/> \
               </interface> \
         </devices> \
         </domain>",
@@ -87,10 +89,12 @@ mod tests {
                     .as_str(),
                 self.disk_config.disk(DiskType::CloudInit).unwrap().as_str(),
                 self.network.guest_mac,
-                self.network.host_ip,
+                self.network.guest_ip,
+                self.net_name,
+                self.bridge_name,
             );
 
-            eprintln!("{}", domain);
+            eprintln!("{}\n", domain);
 
             let mut domain_path = self.tmp_dir.as_path().to_path_buf();
             domain_path.push("domain.xml");
@@ -99,6 +103,28 @@ mod tests {
             f.write_all(&domain.as_bytes()).unwrap();
 
             domain_path
+        }
+
+        fn create_network(&self) -> PathBuf {
+            let network = format!(
+                "<network> \
+                 <name>{}</name> \
+                 <uuid>{}</uuid> \
+                 <bridge name='{}'/> \
+                 <ip address='{}' netmask='255.255.255.0'/> \
+                 </network>",
+                self.net_name, self.net_uuid, self.bridge_name, self.network.host_ip,
+            );
+
+            eprintln!("{}\n", network);
+
+            let mut network_path = self.tmp_dir.as_path().to_path_buf();
+            network_path.push("network.xml");
+
+            let mut f = std::fs::File::create(&network_path).unwrap();
+            f.write_all(&network.as_bytes()).unwrap();
+
+            network_path
         }
 
         fn new_from_ip_range(disk_config: &'a mut dyn DiskConfig, class: &str, id: u8) -> Self {
@@ -135,6 +161,9 @@ mod tests {
                 network,
                 vm_name,
                 uuid: Uuid::new_v4().to_hyphenated().to_string(),
+                net_name: format!("chnet{}", id),
+                bridge_name: format!("chbr{}", id),
+                net_uuid: Uuid::new_v4().to_hyphenated().to_string(),
             }
         }
 
@@ -172,8 +201,27 @@ mod tests {
             .spawn()
     }
 
+    fn spawn_non_hypervisor_virsh<I, S>(args: I) -> io::Result<Child>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new("virsh")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+
+    fn cleanup_libvirt_state() {
+        let _ = std::fs::remove_dir_all("/var/lib/libvirt");
+        let _ = std::fs::remove_file("/var/run/libvirtd.pid");
+        let _ = std::fs::remove_dir_all("/var/run/libvirt");
+    }
+
     #[test]
     fn test_uri() {
+        cleanup_libvirt_state();
         let mut libvirtd = spawn_libvirtd().unwrap();
         thread::sleep(std::time::Duration::new(5, 0));
 
@@ -196,6 +244,7 @@ mod tests {
 
     #[test]
     fn test_create_vm() {
+        cleanup_libvirt_state();
         let mut libvirtd = spawn_libvirtd().unwrap();
         thread::sleep(std::time::Duration::new(5, 0));
 
@@ -203,22 +252,38 @@ mod tests {
         let guest = Guest::new(&mut disk);
 
         let domain_path = guest.create_domain(1 << 30);
-        thread::sleep(std::time::Duration::new(5, 0));
+        let network_path = guest.create_network();
 
         let r = std::panic::catch_unwind(|| {
+            let net_output =
+                spawn_non_hypervisor_virsh(&["net-create", network_path.to_str().unwrap()])
+                    .unwrap()
+                    .wait_with_output()
+                    .unwrap();
+
+            assert!(std::str::from_utf8(&net_output.stdout)
+                .unwrap()
+                .trim()
+                .starts_with(&format!("Network {} created", guest.net_name)));
+
             let output = spawn_virsh(&["create", domain_path.to_str().unwrap()])
                 .unwrap()
                 .wait_with_output()
                 .unwrap();
 
-            thread::sleep(std::time::Duration::new(5, 0));
             assert!(std::str::from_utf8(&output.stdout)
                 .unwrap()
                 .trim()
                 .starts_with(&format!("Domain {} created", guest.vm_name)));
         });
 
+        thread::sleep(std::time::Duration::new(5, 0));
+
         spawn_virsh(&["destroy", &guest.vm_name])
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        spawn_non_hypervisor_virsh(&["net-destroy", &guest.net_name])
             .unwrap()
             .wait_with_output()
             .unwrap();
